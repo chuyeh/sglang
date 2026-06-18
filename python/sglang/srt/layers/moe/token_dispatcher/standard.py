@@ -195,17 +195,22 @@ class StandardDispatcher(BaseDispatcher):
                         )
                     )
 
-        if self.local_expert_mapping is not None and not self.skip_local_expert_mapping:
-            if _use_aiter:
-                self.expert_mask_gpu = (
-                    (
-                        (self.local_expert_mapping >= 0)
-                        & (self.local_expert_mapping < self.num_local_experts)
+                if _use_aiter:
+                    # Same bit pattern as (mapping >= 0) & (mapping < num_local_experts);
+                    # build once here to avoid four elementwise kernels per dispatch().
+                    self.expert_mask_gpu = torch.zeros(
+                        self.num_experts, device=device, dtype=torch.int32
                     )
-                    .to(torch.int32)
-                    .to(device="cuda")
-                )
-            else:
+                    self.expert_mask_gpu[
+                        self.moe_ep_rank
+                        * self.num_local_routed_experts : (self.moe_ep_rank + 1)
+                        * self.num_local_routed_experts
+                    ] = 1
+                    if self.num_local_shared_experts > 0:
+                        self.expert_mask_gpu[-self.num_local_shared_experts :] = 1
+
+        if self.local_expert_mapping is not None and not self.skip_local_expert_mapping:
+            if not _use_aiter:
                 if TopKOutputChecker.format_is_standard(topk_output):
                     topk_output = topk_output._replace(
                         topk_ids=self.local_expert_mapping[topk_output.topk_ids]
