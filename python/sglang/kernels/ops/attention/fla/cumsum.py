@@ -10,6 +10,9 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.utils import check_shared_mem, input_guard
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
@@ -178,6 +181,12 @@ def chunk_local_cumsum_scalar(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
     grid = (NT, B * H)
+    # One program reduces just BT elements, so the disabled autotune above (which
+    # ranged num_warps over 1-8) was doing real work: on gfx9xx the hardcoded 8
+    # asks 8*64 = 512 lanes to cumsum BT=64 values, and the idle wavefronts cost
+    # more than the reduction. Measured on MI355X, 1 warp is 1.05-2.82x faster
+    # across chunked-prefill shapes, with the gap widening as NT*H grows.
+    num_warps = 1 if _is_hip else 8
     chunk_local_cumsum_scalar_kernel[grid](
         s=g_org,
         o=g,
@@ -192,7 +201,7 @@ def chunk_local_cumsum_scalar(
         REVERSE=reverse,
         HAS_SCALE=scale is not None,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=8,
+        num_warps=num_warps,
         num_stages=3,
     )
     return g
