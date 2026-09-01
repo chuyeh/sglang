@@ -598,6 +598,11 @@ def fused_qkvzba_causal_conv1d_update_contiguous(
     a = torch.empty_like(b)
 
     block_size = 256
+    # One warp per 64 elements. gfx9xx wavefronts are 64 lanes wide, so the 8
+    # warps this block size wants on a 32-lane NVIDIA warp leave half of every
+    # AMD wavefront idle -- measured on MI355X, 8 warps fall to 0.81x of the
+    # unfused pair at batch 256 while 4 warps reach 1.34x.
+    num_warps = block_size // 64 if _is_hip else 8
     grid = (batch, triton.cdiv(qkv_dim, block_size))
     _fused_qkvzba_causal_conv1d_update_contiguous_kernel[grid](
         mixed_qkv,
@@ -630,7 +635,7 @@ def fused_qkvzba_causal_conv1d_update_contiguous(
         SILU_ACTIVATION=activation in ("silu", "swish"),
         PAD_SLOT_ID=pad_slot_id,
         BLOCK_SIZE=block_size,
-        num_warps=8,
+        num_warps=num_warps,
         num_stages=2,
     )
     return mixed_qkv, z, b, a
@@ -715,6 +720,12 @@ def fused_qkv_split_gdn_prefill(
     qkv_dim = num_q_heads * head_q + num_k_heads * head_k + num_v_heads * head_v
     if _is_hip and seq_len == 0:
         return q, k, v
+    # One program per token, so per-program work is qkv_dim. On gfx9xx the 8 warps
+    # this kernel asks for only pay off once a token's slice is wide enough to fill
+    # them; narrower slices just add wavefront scheduling overhead. Measured on
+    # MI355X: 1.16-1.53x slower at qkv_dim <= 2048 (e.g. the TP8-sharded MoE
+    # shapes), parity from 3072 up, so the wide case keeps the original 8.
+    num_warps = 1 if (_is_hip and qkv_dim <= 2048) else 8
     fused_qkv_split_gdn_prefill_kernel[(seq_len,)](
         q,
         k,
@@ -729,7 +740,7 @@ def fused_qkv_split_gdn_prefill(
         head_k,
         head_v,
         BLOCK_SIZE=triton.next_power_of_2(qkv_dim),
-        num_warps=8,
+        num_warps=num_warps,
         num_stages=3,
     )
     return q, k, v

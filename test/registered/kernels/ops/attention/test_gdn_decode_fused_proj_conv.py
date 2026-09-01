@@ -9,12 +9,13 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
 )
 
 # This is also the update implementation imported directly by GDNBackend on
-# CUDA; the presence of the optional sgl_kernel AOT extension does not reroute
-# GDN decode through srt.layers.attention.mamba.causal_conv1d.
+# CUDA and ROCm; the presence of the optional sgl_kernel AOT extension does not
+# reroute GDN decode through srt.layers.attention.mamba.causal_conv1d.
 from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=8, stage="jit-kernel-unit", runner_config="amd")
 
 
 def _reference(
@@ -59,7 +60,7 @@ def _reference(
     return out, z, b.contiguous(), a.contiguous(), state_out
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
+@unittest.skipIf(not torch.cuda.is_available(), "a CUDA or ROCm GPU is required")
 class TestGDNDecodeFusedProjectionConv1D(unittest.TestCase):
     def test_contiguous_unpack_ratio8_microbenchmark_baseline(self):
         batch = 9
