@@ -232,6 +232,66 @@ def handle_linear_attn_backend(server_args: Any):
     cfg = resolving_view(server_args)
     import torch
 
+    # ROCm: default hybrid linear-attention models to a bf16 SSM state.
+    #
+    # The recurrent decode kernel is bound by state bandwidth rather than
+    # compute, so the state dtype sets its floor. On MI355X at batch 256 the
+    # state is 22.5 GB of reads plus writes per step, which predicts 4.25 ms
+    # at 5.3 TB/s against 4.06 ms measured -- already at the roofline, so the
+    # only way to make it faster is to move half as much. Halving the state
+    # also doubles the slots the mamba pool holds, and on these models the
+    # pool, not the KV cache, is what bounds concurrency.
+    #
+    # Measured on gfx950 (peak decode, ISL/OSL 1024): Qwen3.5-397B TP4
+    # 7729 -> 11092 tok/s with the request clamp going 388 -> 763, and
+    # Qwen3.8-2.4T TP8 2059 -> 3207 tok/s with the clamp going 104 -> 207.
+    # gsm8k is unchanged on both (0.932 -> 0.939 and 0.945 -> 0.941, n=1319,
+    # each inside 1 sigma), and NEXTN accept length is unchanged (3.30 ->
+    # 3.32). This overrides a float32 in the checkpoint config, so it is
+    # logged; pass --mamba-ssm-dtype float32 to restore the old behaviour.
+    #
+    # Left on float32: replayssm-spec folds the state bit-exactly against an
+    # fp32 recurrent baseline, and the DFlash/DSpark verify paths are not
+    # measured here -- sgl-project/sglang#36889 reports shorter accept
+    # lengths with a bf16 state under DFlash on other hardware. Mamba2-style
+    # models are also left alone; the bound is the same in principle, but the
+    # numbers above are GDN and nothing here has been measured on them.
+    # Detect GDN off linear_num_key_heads, which is what the qwen3_next and
+    # qwen3_5 model files themselves branch on. Two nearby signals do not work
+    # here: the linear-attn registry is filled when the model classes import,
+    # which is after argument resolution, so it answers None for every model;
+    # and layer_types is dropped by these config classes, which rebuild the
+    # layout from full_attention_interval. The text config is the one to ask,
+    # since Qwen3.5 ships as a ...ForConditionalGeneration that nests its
+    # language config underneath.
+    model_config = model_config_of(server_args)
+    hf_config = getattr(model_config, "hf_config", None)
+    text_config = (
+        hf_config.get_text_config()
+        if hasattr(hf_config, "get_text_config")
+        else hf_config
+    )
+    spec_algorithm = str(cfg.speculative_algorithm or "").upper()
+    if (
+        get_platform().is_hip
+        and cfg.mamba_ssm_dtype is None
+        and getattr(text_config, "linear_num_key_heads", None)
+        and not cfg.enable_linear_replayssm_spec
+        and "DFLASH" not in spec_algorithm
+        and "DSPARK" not in spec_algorithm
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_linear_attn_backend",
+            mamba_ssm_dtype="bfloat16",
+        )
+        logger.info(
+            "ROCm: defaulting --mamba-ssm-dtype to bfloat16 for this hybrid "
+            "linear-attention model. This halves the SSM state, which is the "
+            "bandwidth bound of the recurrent decode kernel and the capacity "
+            "bound of the mamba pool. Pass --mamba-ssm-dtype float32 to opt out."
+        )
+
     # SM100+: default to FlashInfer GDN decode (and MTP verify, via pool API)
     # when the user hasn't explicitly chosen a decode backend and
     # mamba-ssm-dtype is bf16 (required by FlashInfer GDN on SM100+).
